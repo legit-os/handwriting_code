@@ -1,0 +1,13 @@
+[project]
+name = "handwriting-code"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.143.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.14.1",
+    "ruff>=0.17.0",
+    "uvicorn[standard]>=0.54.0",
+]
