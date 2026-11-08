@@ -16,6 +16,8 @@ test('extension mapping handles folders, case, and common aliases', () => {
   assert.equal(getEditorLanguage('src/header.hpp'), 'cpp');
   assert.equal(getEditorLanguage('notes.json'), 'json');
   assert.equal(getEditorLanguage('page.html'), 'html');
+  assert.equal(getEditorLanguage('queries/report.SQL'), 'sql');
+  assert.equal(getServiceLanguage('queries/report.SQL'), 'sqlite');
   assert.equal(getServiceLanguage('notes.json'), null);
   assert.equal(getEditorLanguage('unknown.file'), 'plaintext');
 });

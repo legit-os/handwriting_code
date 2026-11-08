@@ -16,6 +16,8 @@ from backend.app import (
     recognize,
     run_code,
     source_name,
+    execute_sql_script,
+    SQLScriptError,
     strip_markdown_code_fence,
     warm_model,
 )
@@ -75,6 +77,10 @@ class MarkdownFenceTests(unittest.TestCase):
         wrapped = "Here is the code:\n```python\nprint('hello')\n```"
         self.assertEqual(strip_markdown_code_fence(wrapped), wrapped)
 
+    def test_removes_repeated_fence_artifacts_and_duplicate_transcription(self):
+        response = "OK\n```\n```markdown\n\nOK\n```\nOK\n```\n```"
+        self.assertEqual(strip_markdown_code_fence(response), "OK")
+
 
 class OllamaServiceTests(unittest.TestCase):
     def test_health_reports_installed_model(self):
@@ -89,7 +95,7 @@ class OllamaServiceTests(unittest.TestCase):
         with patch("backend.app.httpx.AsyncClient", FakeOllamaClient):
             result = asyncio.run(warm_model())
         self.assertEqual(result["status"], "warm")
-        self.assertEqual(FakeOllamaClient.last_request["json"]["keep_alive"], "10m")
+        self.assertEqual(FakeOllamaClient.last_request["json"]["keep_alive"], "20m")
 
     def test_recognition_strips_markdown_before_returning_text(self):
         FakeOllamaClient.next_payload = {"response": "```python\ndef answer():\n    return 42\n```"}
@@ -98,7 +104,9 @@ class OllamaServiceTests(unittest.TestCase):
         with patch("backend.app.httpx.AsyncClient", FakeOllamaClient):
             result = asyncio.run(recognize(RecognizeRequest(image=image), request))
         self.assertEqual(result["text"], "def answer():\n    return 42")
-        self.assertEqual(FakeOllamaClient.last_request["json"]["keep_alive"], "10m")
+        self.assertEqual(FakeOllamaClient.last_request["json"]["keep_alive"], "20m")
+        self.assertEqual(FakeOllamaClient.last_request["json"]["options"], {"temperature": 0, "num_predict": 256})
+        self.assertTrue(FakeOllamaClient.last_request["json"]["prompt"].startswith("Text Recognition:"))
 
     def test_recognition_returns_cancelled_when_client_disconnects(self):
         FakeOllamaClient.next_payload = {"response": "ignored"}
@@ -156,6 +164,35 @@ class LanguageAdapterTests(unittest.TestCase):
             result = asyncio.run(run_code(CodeRequest(code="print('ok')", language="python")))
         self.assertEqual(result["exit_code"], 127)
         self.assertIn("not installed", result["output"])
+
+
+class SQLiteRunnerTests(unittest.TestCase):
+    def test_executes_script_and_prints_select_results(self):
+        result = execute_sql_script(
+            "CREATE TABLE tasks (id INTEGER, title TEXT);\n"
+            "INSERT INTO tasks VALUES (1, 'review; merge'), (2, 'ship');\n"
+            "SELECT id, title FROM tasks ORDER BY id;"
+        )
+        self.assertIn("Query 3 (2 rows):", result)
+        self.assertIn("1\treview; merge", result)
+        self.assertIn("2\tship", result)
+
+    def test_lint_and_run_routes_support_sqlite(self):
+        code = "SELECT 42 AS answer;"
+        lint_result = asyncio.run(lint(CodeRequest(code=code, language="sqlite")))
+        run_result = asyncio.run(run_code(CodeRequest(code=code, language="sqlite")))
+        self.assertTrue(lint_result["ok"])
+        self.assertEqual(run_result["exit_code"], 0)
+        self.assertIn("42", run_result["output"])
+
+    def test_reports_invalid_sql_with_source_line(self):
+        code = "CREATE TABLE tasks (id INTEGER);\nSELECT * FROM missing_table;"
+        with self.assertRaises(SQLScriptError) as error:
+            execute_sql_script(code)
+        self.assertEqual(error.exception.line, 2)
+        lint_result = asyncio.run(lint(CodeRequest(code=code, language="sqlite")))
+        self.assertFalse(lint_result["ok"])
+        self.assertIn("line 2", lint_result["output"])
 
 
 if __name__ == "__main__":

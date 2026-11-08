@@ -3,12 +3,15 @@ from __future__ import annotations
 import base64
 import asyncio
 import binascii
+from contextlib import closing
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -18,6 +21,7 @@ from pydantic import BaseModel, Field
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "glm-ocr:latest")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "20m")
 app = FastAPI(title="NoteBookIDE local API")
 app.add_middleware(
     CORSMiddleware,
@@ -37,10 +41,84 @@ class CodeRequest(BaseModel):
 
 
 def strip_markdown_code_fence(text: str) -> str:
-    """Remove one surrounding Markdown fence while preserving code indentation."""
+    """Remove Markdown fences and common repeated-fence OCR artifacts."""
     text = text.strip()
     fenced = re.fullmatch(r"(```|''')[\w.+-]*[ \t]*\r?\n([\s\S]*?)\r?\n\1", text)
-    return fenced.group(2).strip("\r\n") if fenced else text
+    if fenced:
+        text = fenced.group(2).strip("\r\n")
+
+    lines = text.splitlines()
+    fence_pattern = re.compile(r"\s*(?:```|''')(?:[\w.+-]+)?\s*")
+    fence_count = sum(bool(fence_pattern.fullmatch(line)) for line in lines)
+    if fence_count <= 3:
+        return text
+
+    cleaned: list[str] = []
+    for line in lines:
+        if fence_pattern.fullmatch(line):
+            continue
+        if not line.strip() and (not cleaned or not cleaned[-1].strip()):
+            continue
+        if line.strip() and cleaned:
+            previous_text = next((item.strip() for item in reversed(cleaned) if item.strip()), None)
+            if previous_text == line.strip():
+                while cleaned and not cleaned[-1].strip():
+                    cleaned.pop()
+                continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip("\r\n")
+
+
+def split_sql_statements(code: str) -> list[tuple[str, int]]:
+    """Split a SQL script at complete semicolons while respecting quoted text."""
+    statements: list[tuple[str, int]] = []
+    buffer = ""
+    line = 1
+    start_line = 1
+    for character in code:
+        if not buffer.strip():
+            start_line = line
+        buffer += character
+        if character == ";" and sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement:
+                statements.append((statement, start_line))
+            buffer = ""
+        if character == "\n":
+            line += 1
+    if buffer.strip():
+        statements.append((buffer.strip(), start_line))
+    return statements
+
+
+class SQLScriptError(Exception):
+    def __init__(self, line: int, message: str):
+        super().__init__(f"line {line}: {message}")
+        self.line = line
+
+
+def execute_sql_script(code: str, timeout: float = 5) -> str:
+    """Execute a script against a fresh in-memory SQLite database."""
+    output: list[str] = []
+    deadline = time.monotonic() + timeout
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
+        for index, (statement, line) in enumerate(split_sql_statements(code), start=1):
+            try:
+                cursor = connection.execute(statement)
+                if cursor.description:
+                    columns = [item[0] for item in cursor.description]
+                    rows = cursor.fetchall()
+                    output.append(f"Query {index} ({len(rows)} row{'s' if len(rows) != 1 else ''}):")
+                    output.append("\t".join(columns))
+                    output.extend("\t".join("NULL" if value is None else str(value).replace("\n", "\\n") for value in row) for row in rows)
+                else:
+                    affected = cursor.rowcount
+                    suffix = f" ({affected} row{'s' if affected != 1 else ''} affected)" if affected >= 0 else ""
+                    output.append(f"Statement {index}: executed{suffix}.")
+            except sqlite3.Error as error:
+                raise SQLScriptError(line, str(error)) from error
+    return "\n".join(output) if output else "SQL script completed (no statements)."
 
 
 @app.get("/api/health")
@@ -63,7 +141,7 @@ async def warm_model() -> dict[str, str]:
         async with httpx.AsyncClient(timeout=180) as client:
             response = await client.post(
                 f"{OLLAMA_URL.rstrip('/')}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": " ", "stream": False, "keep_alive": "10m", "options": {"num_predict": 1}},
+                json={"model": OLLAMA_MODEL, "prompt": " ", "stream": False, "keep_alive": OLLAMA_KEEP_ALIVE, "options": {"num_predict": 1}},
             )
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -86,10 +164,11 @@ async def recognize(payload: RecognizeRequest, request: Request) -> dict[str, st
                 f"{OLLAMA_URL.rstrip('/')}/api/generate",
                 json={
                     "model": OLLAMA_MODEL,
-                    "prompt": "Read the handwritten source code in this image. Return only the code as plain text. Preserve indentation, punctuation, and line breaks. Do not explain or use markdown fences.",
+                    "prompt": "Text Recognition: Transcribe only the handwritten text that is visibly present in this image. Preserve spelling, capitalization, punctuation, line breaks, and indentation. Do not interpret, correct, complete, repeat, explain, or wrap the result in Markdown.",
                     "images": [encoded],
                     "stream": False,
-                    "keep_alive": "10m",
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
+                    "options": {"temperature": 0, "num_predict": 256},
                 },
             ))
             while not upstream.done():
@@ -150,6 +229,12 @@ def execute(command: list[str], folder: Path, timeout: int = 10) -> subprocess.C
 @app.post("/api/lint")
 async def lint(payload: CodeRequest) -> dict[str, str | bool]:
     language = payload.language.lower()
+    if language == "sqlite":
+        try:
+            execute_sql_script(payload.code)
+            return {"ok": True, "output": "SQLite script check passed."}
+        except SQLScriptError as error:
+            return {"ok": False, "output": str(error)}
     if language not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=400, detail=f"Unsupported language: {language}")
     with tempfile.TemporaryDirectory(prefix="notebookide-check-") as temp_dir:
@@ -174,8 +259,13 @@ async def lint(payload: CodeRequest) -> dict[str, str | bool]:
 @app.post("/api/run")
 async def run_code(payload: CodeRequest) -> dict[str, str | int]:
     # This endpoint is intended for trusted local code; it is not an OS-level sandbox.
+    language = payload.language.lower()
+    if language == "sqlite":
+        try:
+            return {"output": execute_sql_script(payload.code), "exit_code": 0}
+        except SQLScriptError as error:
+            return {"output": str(error), "exit_code": 1}
     with tempfile.TemporaryDirectory(prefix="notebookide-") as temp_dir:
-        language = payload.language.lower()
         if language not in SUPPORTED_LANGUAGES:
             raise HTTPException(status_code=400, detail=f"Unsupported language: {language}")
         folder = Path(temp_dir)

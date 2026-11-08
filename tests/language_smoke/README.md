@@ -12,3 +12,4 @@ Open one of these files in NoteBookIDE and press **Run**. Each file runs a tiny 
 | `cpp_test.cpp` | G++ |
 | `go_test.go` | Go |
 | `rust_test.rs` | Rust |
+| `sqlite_test.sql` | Built-in SQLite runner (in-memory database) |
